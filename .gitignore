@@ -1,0 +1,23 @@
+# ===== macOS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ===== PlatformIO (Arduino) =====
+arduino/.pio/
+arduino/.pioenvs/
+arduino/.piolibdeps/
+
+# ===== Next.js =====
+web/.next/
+web/out/
+web/node_modules/
+web/.vercel/
+web/.env
+web/.env.local
+web/.env.development.local
+web/.env.test.local
+web/.env.production.local
+
+# ===== Vercel =====
+.vercel/
