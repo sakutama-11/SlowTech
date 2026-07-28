@@ -1,170 +1,201 @@
-#include <ArduinoBLE.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 
-// BLEサービスとキャラクタリスティックのUUID（任意のUUIDでOK）
-BLEService scentService("19B10000-E8F2-537E-4F6C-D104768A1214");
-BLECharacteristic scentCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLEWrite, 3); // 3バイトのデータを受信
-BLEByteCharacteristic presenceCharacteristic("19B10002-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify); // 1:置いた 0:外した
+const int photoSensorPin = 34;
+const int diffuserPin = 25;
+const int toggleButtonPin = 0;
 
-// ファンのPWMピン
-const int fanPin1 = 3;
-const int fanPin2 = 5;
-const int fanPin3 = 6;
-
-// フォトリフレクタ設定
-const int photoSensorPin = A0;
-const int photoThreshold = 500;
+const int photoThreshold = 20;
 const bool presenceActiveHigh = true;
+const bool useButtonToggleSimulation = false;
 const unsigned long sensorDebounceMs = 120;
+const unsigned long helloIntervalMs = 2000;
+const unsigned long statusIntervalMs = 1000;
+const unsigned long peerTimeoutMs = 15000;
+const unsigned long buttonDebounceMs = 40;
+
+const uint8_t diffuserChannel = 0;
+const uint16_t diffuserPwmFreq = 5000;
+const uint8_t diffuserPwmRes = 8;
+const uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+struct EventRecord {
+  String id;
+  uint8_t state;
+  unsigned long ts;
+};
+
+struct EspNowMessage {
+  uint8_t msgType;
+  uint32_t seq;
+  uint8_t senderMac[6];
+  uint8_t state;
+};
+
+enum MessageType : uint8_t {
+  MSG_HELLO = 1,
+  MSG_STATE = 2,
+};
+
+const size_t HISTORY_SIZE = 32;
+EventRecord selfHistory[HISTORY_SIZE];
+EventRecord othersHistory[HISTORY_SIZE];
+size_t selfCount = 0;
+size_t othersCount = 0;
 
 bool pendingPresence = false;
 bool stablePresence = false;
 unsigned long pendingSinceMs = 0;
+int lastButtonReading = HIGH;
+int stableButtonState = HIGH;
+unsigned long lastButtonChangeMs = 0;
 
-// 現在のファン状態（各ファンのPWM値: 0-255）
-struct FanState {
-  uint8_t fan1;
-  uint8_t fan2;
-  uint8_t fan3;
-} currentFanState = {0, 0, 0};
+uint8_t selfMac[6] = {0};
+uint8_t peerMac[6] = {0};
+bool peerKnown = false;
+unsigned long lastPeerSeenMs = 0;
+unsigned long lastHelloMs = 0;
+unsigned long lastStatusMs = 0;
+uint32_t selfSeq = 0;
 
-// 関数プロトタイプ宣言
-void onScentDataReceived(BLEDevice central, BLECharacteristic characteristic);
-bool isStopCommand(const uint8_t* data);
-void handleScentData(const uint8_t* data);
-void handleStopCommand();
-void applyFanState();
-void updatePresenceState();
-bool readPresenceRaw();
-void publishPresenceState(bool isPlaced);
+String macToString(const uint8_t* mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
 
-void setup() {
-  Serial.begin(9600);
-  while (!Serial);  // シリアルモニタが開くまで待機（デバッグ用 - 不要になったら削除）
-  
-  pinMode(fanPin1, OUTPUT);
-  pinMode(fanPin2, OUTPUT);
-  pinMode(fanPin3, OUTPUT);
-  pinMode(photoSensorPin, INPUT);
+bool sameMac(const uint8_t* a, const uint8_t* b) {
+  return memcmp(a, b, 6) == 0;
+}
 
-  if (!BLE.begin()) {
-    Serial.println("BLEの初期化に失敗しました。");
-    while (1);
+void pushHistory(EventRecord* history, size_t& count, const String& id, uint8_t state) {
+  if (count < HISTORY_SIZE) {
+    history[count++] = {id, state, millis()};
+    return;
   }
 
-  // デバイス名の設定（Web側からこの名前を探す）
-  BLE.setLocalName("Yohako-01");
-  BLE.setAdvertisedService(scentService);
-
-  scentService.addCharacteristic(scentCharacteristic);
-  scentService.addCharacteristic(presenceCharacteristic);
-  BLE.addService(scentService);
-
-  // データ受信時のコールバックを設定
-  scentCharacteristic.setEventHandler(BLEWritten, onScentDataReceived);
-
-  // BLEアドバタイズ開始
-  BLE.advertise();
-  Serial.println("BLE待機中... デバイス名: Yohako-01");
-
-  // センサー状態を初期化し、接続直後に読めるよう現在状態を反映
-  stablePresence = readPresenceRaw();
-  pendingPresence = stablePresence;
-  pendingSinceMs = millis();
-  publishPresenceState(stablePresence);
-}
-
-void loop() {
-  // [DEBUG] 1秒ごとにファンをON/OFFして基板接続確認（デバッグ用 - 不要になったら削除）
-  static bool fanDebugOn = false;
-  static unsigned long lastFanToggleMs = 0;
-  unsigned long nowLoop = millis();
-  if (nowLoop - lastFanToggleMs >= 1000) {
-    lastFanToggleMs = nowLoop;
-    fanDebugOn = !fanDebugOn;
-    uint8_t val = fanDebugOn ? 200 : 0;
-    analogWrite(fanPin1, val);
-    analogWrite(fanPin2, val);
-    analogWrite(fanPin3, val);
-    Serial.print("[DEBUG] fan=");
-    Serial.println(fanDebugOn ? "ON" : "OFF");
+  for (size_t i = 1; i < HISTORY_SIZE; ++i) {
+    history[i - 1] = history[i];
   }
-
-  // BLEのポーリング処理
-  BLE.poll();
-  
-  // 現在のファン状態を反映
-  applyFanState();
-
-  // フォトリフレクタから配置状態を監視し、変化時のみ通知
-  updatePresenceState();
+  history[HISTORY_SIZE - 1] = {id, state, millis()};
 }
 
-// Webアプリからデータを受信した時に呼ばれる処理
-void onScentDataReceived(BLEDevice central, BLECharacteristic characteristic) {
-  const uint8_t* data = characteristic.value();
-  
-  if (characteristic.valueLength() == 3) {
-    // 受信したデータをファン状態に変換
-    if (isStopCommand(data)) {
-      handleStopCommand();
-    } else {
-      handleScentData(data);
-    }
-  }
+uint8_t latestSelfState() {
+  return selfCount == 0 ? 0 : selfHistory[selfCount - 1].state;
 }
 
-// 停止コマンド（0,0,0）かどうかを判定
-bool isStopCommand(const uint8_t* data) {
-  return (data[0] == 0 && data[1] == 0 && data[2] == 0);
+uint8_t latestOthersState() {
+  return othersCount == 0 ? 0 : othersHistory[othersCount - 1].state;
 }
 
-// 香りデータを受信した時の処理
-void handleScentData(const uint8_t* data) {
-  currentFanState.fan1 = data[0];
-  currentFanState.fan2 = data[1];
-  currentFanState.fan3 = data[2];
-
-  Serial.print("香りデータ受信 - Fan1: "); Serial.print(currentFanState.fan1);
-  Serial.print(" Fan2: "); Serial.print(currentFanState.fan2);
-  Serial.print(" Fan3: "); Serial.println(currentFanState.fan3);
-}
-
-// 停止コマンドを受信した時の処理
-void handleStopCommand() {
-  currentFanState.fan1 = 0;
-  currentFanState.fan2 = 0;
-  currentFanState.fan3 = 0;
-  
-  Serial.println("停止コマンド受信 - すべてのファンを停止します。");
-}
-
-// 現在のファン状態をハードウェアに反映
-void applyFanState() {
-  analogWrite(fanPin1, currentFanState.fan1);
-  analogWrite(fanPin2, currentFanState.fan2);
-  analogWrite(fanPin3, currentFanState.fan3);
+void applyDiffuserRule() {
+  uint8_t outputValue = (latestSelfState() == 1 && latestOthersState() == 1) ? 255 : 0;
+  ledcWrite(diffuserChannel, outputValue);
 }
 
 bool readPresenceRaw() {
   int raw = analogRead(photoSensorPin);
-
-  // [DEBUG] フォトリフレクタ生値をシリアルモニタに出力（デバッグ用 - 不要になったら削除）
-  static unsigned long lastDebugMs = 0;
-  unsigned long nowMs = millis();
-  if (nowMs - lastDebugMs >= 200) {
-    lastDebugMs = nowMs;
-    Serial.print("[DEBUG] photoSensor raw=");
-    Serial.print(raw);
-    Serial.print(" threshold=");
-    Serial.print(photoThreshold);
-    Serial.print(" detected=");
-    Serial.println((presenceActiveHigh ? raw >= photoThreshold : raw <= photoThreshold) ? "YES" : "NO");
-  }
-
   if (presenceActiveHigh) {
     return raw >= photoThreshold;
   }
   return raw <= photoThreshold;
+}
+
+void addPeerIfNeeded(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) {
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+void rememberPeer(const uint8_t* mac) {
+  if (sameMac(mac, selfMac)) {
+    return;
+  }
+
+  memcpy(peerMac, mac, 6);
+  peerKnown = true;
+  lastPeerSeenMs = millis();
+  addPeerIfNeeded(mac);
+}
+
+void handleRemoteState(const uint8_t* senderMac, uint8_t state) {
+  rememberPeer(senderMac);
+  pushHistory(othersHistory, othersCount, macToString(senderMac), state);
+  applyDiffuserRule();
+
+  Serial.print("[OTHER] id=");
+  Serial.print(macToString(senderMac));
+  Serial.print(" state=");
+  Serial.println(state);
+}
+
+void sendMessage(const uint8_t* destination, MessageType msgType, uint8_t state) {
+  EspNowMessage msg = {};
+  msg.msgType = static_cast<uint8_t>(msgType);
+  msg.seq = ++selfSeq;
+  memcpy(msg.senderMac, selfMac, 6);
+  msg.state = state;
+  esp_now_send(destination, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
+}
+
+void sendHello() {
+  sendMessage(broadcastMac, MSG_HELLO, latestSelfState());
+}
+
+void publishSelfEvent(uint8_t state) {
+  pushHistory(selfHistory, selfCount, macToString(selfMac), state);
+  applyDiffuserRule();
+
+  Serial.print("[SELF] id=");
+  Serial.print(macToString(selfMac));
+  Serial.print(" state=");
+  Serial.println(state);
+
+  sendMessage(broadcastMac, MSG_STATE, state);
+  if (peerKnown) {
+    sendMessage(peerMac, MSG_STATE, state);
+  }
+}
+
+void onDataSent(const uint8_t* macAddr, esp_now_send_status_t status) {
+  (void)macAddr;
+  (void)status;
+}
+
+void onDataRecv(const uint8_t* macAddr, const uint8_t* data, int dataLen) {
+  if (dataLen != sizeof(EspNowMessage)) {
+    return;
+  }
+
+  EspNowMessage msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  if (sameMac(msg.senderMac, selfMac)) {
+    return;
+  }
+
+  rememberPeer(msg.senderMac);
+
+  if (msg.msgType == MSG_HELLO) {
+    if (!peerKnown || sameMac(peerMac, msg.senderMac)) {
+      sendMessage(peerMac, MSG_HELLO, latestSelfState());
+    }
+    return;
+  }
+
+  if (msg.msgType == MSG_STATE) {
+    handleRemoteState(msg.senderMac, msg.state ? 1 : 0);
+  }
 }
 
 void updatePresenceState() {
@@ -179,17 +210,133 @@ void updatePresenceState() {
 
   if ((nowMs - pendingSinceMs) >= sensorDebounceMs && stablePresence != pendingPresence) {
     stablePresence = pendingPresence;
-    publishPresenceState(stablePresence);
+    publishSelfEvent(stablePresence ? 1 : 0);
   }
 }
 
-void publishPresenceState(bool isPlaced) {
-  uint8_t value = isPlaced ? 1 : 0;
-  presenceCharacteristic.writeValue(value);
+void updateButtonToggle() {
+  int reading = digitalRead(toggleButtonPin);
+  unsigned long nowMs = millis();
 
-  if (isPlaced) {
-    Serial.println("配置検知: 置いた");
-  } else {
-    Serial.println("配置検知: 外した");
+  if (reading != lastButtonReading) {
+    lastButtonReading = reading;
+    lastButtonChangeMs = nowMs;
   }
+
+  if ((nowMs - lastButtonChangeMs) < buttonDebounceMs) {
+    return;
+  }
+
+  if (reading != stableButtonState) {
+    stableButtonState = reading;
+
+    // GPIO0 button is active low; toggle self state on single press.
+    if (stableButtonState == LOW) {
+      stablePresence = !stablePresence;
+      pendingPresence = stablePresence;
+      pendingSinceMs = nowMs;
+      publishSelfEvent(stablePresence ? 1 : 0);
+
+      Serial.print("[BUTTON] toggle self=");
+      Serial.println(stablePresence ? 1 : 0);
+    }
+  }
+}
+
+void maintainPeerDiscovery() {
+  unsigned long now = millis();
+
+  if (now - lastHelloMs >= helloIntervalMs) {
+    lastHelloMs = now;
+    sendHello();
+  }
+
+  if (peerKnown && (now - lastPeerSeenMs) > peerTimeoutMs) {
+    peerKnown = false;
+    memset(peerMac, 0, sizeof(peerMac));
+    othersCount = 0;
+    applyDiffuserRule();
+    Serial.println("[PEER] timed out");
+  }
+}
+
+void printStatusPeriodically() {
+  unsigned long now = millis();
+  if (now - lastStatusMs < statusIntervalMs) {
+    return;
+  }
+  lastStatusMs = now;
+
+  int raw = analogRead(photoSensorPin);
+  Serial.print("[STATUS] self=");
+  Serial.print((int)latestSelfState());
+  Serial.print(" other=");
+  Serial.print((int)latestOthersState());
+  Serial.print(" diffuser=");
+  Serial.print((latestSelfState() == 1 && latestOthersState() == 1) ? 1 : 0);
+  Serial.print(" peer=");
+  Serial.print(peerKnown ? macToString(peerMac) : String("none"));
+  Serial.print(" sensorRaw=");
+  Serial.println(raw);
+}
+
+void setupEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
+
+  esp_now_peer_info_t broadcastPeer = {};
+  memcpy(broadcastPeer.peer_addr, broadcastMac, 6);
+  broadcastPeer.channel = 0;
+  broadcastPeer.ifidx = WIFI_IF_STA;
+  broadcastPeer.encrypt = false;
+  if (!esp_now_is_peer_exist(broadcastMac)) {
+    esp_now_add_peer(&broadcastPeer);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(photoSensorPin, INPUT);
+  pinMode(toggleButtonPin, INPUT_PULLUP);
+  ledcSetup(diffuserChannel, diffuserPwmFreq, diffuserPwmRes);
+  ledcAttachPin(diffuserPin, diffuserChannel);
+  ledcWrite(diffuserChannel, 0);
+
+  analogReadResolution(12);
+  setupEspNow();
+  WiFi.macAddress(selfMac);
+
+  Serial.print("Boot MAC=");
+  Serial.println(macToString(selfMac));
+
+  stablePresence = useButtonToggleSimulation ? false : readPresenceRaw();
+  pendingPresence = stablePresence;
+  pendingSinceMs = millis();
+  publishSelfEvent(stablePresence ? 1 : 0);
+  sendHello();
+}
+
+void loop() {
+  maintainPeerDiscovery();
+  if (useButtonToggleSimulation) {
+    updateButtonToggle();
+  } else {
+    updatePresenceState();
+  }
+  applyDiffuserRule();
+  printStatusPeriodically();
+  delay(20);
 }
