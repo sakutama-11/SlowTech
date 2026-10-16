@@ -6,17 +6,20 @@
 const int photoSensorPin = 34;
 const int diffuserPin = 25;
 const int toggleButtonPin = 0;
+const int otherLampPin = 15;
 
 const int photoThreshold = 20;
 const bool presenceActiveHigh = true;
-const bool useButtonToggleSimulation = false;
+const bool useButtonToggleSimulation = true;
 const unsigned long sensorDebounceMs = 120;
 const unsigned long helloIntervalMs = 2000;
 const unsigned long statusIntervalMs = 1000;
 const unsigned long peerTimeoutMs = 15000;
 const unsigned long buttonDebounceMs = 40;
+const char serialToggleChar = ' ';
 
 const uint8_t diffuserChannel = 0;
+const uint8_t fallbackPeerMac[6] = {0xEC, 0xE3, 0x34, 0xD2, 0x7A, 0xE8};
 const uint16_t diffuserPwmFreq = 5000;
 const uint8_t diffuserPwmRes = 8;
 const uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -94,6 +97,9 @@ uint8_t latestOthersState() {
 void applyDiffuserRule() {
   uint8_t outputValue = (latestSelfState() == 1 && latestOthersState() == 1) ? 255 : 0;
   ledcWrite(diffuserChannel, outputValue);
+
+  // Light a separate lamp when the latest remote state is 1.
+  digitalWrite(otherLampPin, latestOthersState() == 1 ? HIGH : LOW);
 }
 
 bool readPresenceRaw() {
@@ -195,6 +201,25 @@ void onDataRecv(const uint8_t* macAddr, const uint8_t* data, int dataLen) {
 
   if (msg.msgType == MSG_STATE) {
     handleRemoteState(msg.senderMac, msg.state ? 1 : 0);
+  }
+}
+
+void triggerManualSignal() {
+  stablePresence = true;
+  pendingPresence = true;
+  pendingSinceMs = millis();
+  rememberPeer(fallbackPeerMac);
+  publishSelfEvent(1);
+  sendMessage(fallbackPeerMac, MSG_STATE, 1);
+  Serial.println("[SERIAL] manual signal sent");
+}
+
+void handleSerialInput() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == serialToggleChar || c == 't' || c == 'T' || c == '1') {
+      triggerManualSignal();
+    }
   }
 }
 
@@ -303,6 +328,15 @@ void setupEspNow() {
   if (!esp_now_is_peer_exist(broadcastMac)) {
     esp_now_add_peer(&broadcastPeer);
   }
+
+  esp_now_peer_info_t fallbackPeer = {};
+  memcpy(fallbackPeer.peer_addr, fallbackPeerMac, 6);
+  fallbackPeer.channel = 0;
+  fallbackPeer.ifidx = WIFI_IF_STA;
+  fallbackPeer.encrypt = false;
+  if (!esp_now_is_peer_exist(fallbackPeerMac)) {
+    esp_now_add_peer(&fallbackPeer);
+  }
 }
 
 void setup() {
@@ -311,6 +345,8 @@ void setup() {
 
   pinMode(photoSensorPin, INPUT);
   pinMode(toggleButtonPin, INPUT_PULLUP);
+  pinMode(otherLampPin, OUTPUT);
+  digitalWrite(otherLampPin, LOW);
   ledcSetup(diffuserChannel, diffuserPwmFreq, diffuserPwmRes);
   ledcAttachPin(diffuserPin, diffuserChannel);
   ledcWrite(diffuserChannel, 0);
@@ -321,6 +357,7 @@ void setup() {
 
   Serial.print("Boot MAC=");
   Serial.println(macToString(selfMac));
+  Serial.println("Type space to send a manual signal to EC:E3:34:D2:7A:E8");
 
   stablePresence = useButtonToggleSimulation ? false : readPresenceRaw();
   pendingPresence = stablePresence;
@@ -330,6 +367,7 @@ void setup() {
 }
 
 void loop() {
+  handleSerialInput();
   maintainPeerDiscovery();
   if (useButtonToggleSimulation) {
     updateButtonToggle();
