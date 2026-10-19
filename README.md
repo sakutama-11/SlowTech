@@ -117,9 +117,25 @@ npm run dev
 
 ### 6.3 Vercel
 
-1. `web` ディレクトリを Vercel プロジェクトとしてデプロイ
-2. Vercel KV をプロジェクトへ接続
-3. HTTPS 環境で Android Chrome からアクセス
+1. VercelでこのリポジトリをImportする
+2. Project Settings > General > Root Directoryで`web`を指定する
+3. Framework Presetが`Next.js`、Build Commandが`npm run build`になっていることを確認する
+4. StorageからRedis（旧Vercel KV）を作成し、このプロジェクトに接続する
+5. Environment Variablesに`KV_REST_API_URL`と`KV_REST_API_TOKEN`が追加されていることを確認する
+6. Deployを実行する
+7. HTTPSの本番URLをAndroid Chromeから開いて動作確認する
+
+ローカルでは、`web/.env.example`を`web/.env.local`としてコピーし、Redis接続情報を設定する。`.env.local`はGitにコミットしないこと。
+
+Vercel CLIを使う場合は、リポジトリのルートで次を実行する。
+
+```bash
+cd web
+npx vercel
+npx vercel --prod
+```
+
+CLIでもRoot Directoryを`web`として扱うため、Vercelダッシュボードから設定する場合と同じ構成になる。
 
 ## 7. 注意点
 
